@@ -187,7 +187,7 @@ fn main() {
     }
 
     println!("{}", results);
-    write_string("tests/proposals", &results).unwrap();
+    write_string("tests/proposals.lock", &results).unwrap();
 }
 
 fn clean() {
