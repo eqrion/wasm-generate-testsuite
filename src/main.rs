@@ -1,16 +1,14 @@
 use std::env;
-use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use regex::RegexSetBuilder;
-use serde_derive::Deserialize;
+use serde_derive::{Serialize, Deserialize};
 use toml;
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct Config {
-    repos: Vec<Repo>,
     #[serde(default)]
     harness_directive: Option<String>,
     #[serde(default)]
@@ -19,16 +17,29 @@ struct Config {
     included_tests: Vec<String>,
     #[serde(default)]
     excluded_tests: Vec<String>,
+    repos: Vec<Repo>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+impl Config {
+    fn find_repo(&self, name: &str) -> Option<&Repo> {
+        self
+            .repos
+            .iter()
+            .find(|x| &x.name == name)
+    }
+
+    fn find_repo_mut(&mut self, name: &str) -> Option<&mut Repo> {
+        self
+            .repos
+            .iter_mut()
+            .find(|x| &x.name == name)
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct Repo {
     name: String,
     url: String,
-    #[serde(default)]
-    skip_merge: bool,
-    #[serde(default)]
-    commit: Option<String>,
     #[serde(default)]
     parent: Option<String>,
     #[serde(default)]
@@ -37,6 +48,18 @@ struct Repo {
     included_tests: Vec<String>,
     #[serde(default)]
     excluded_tests: Vec<String>,
+
+    // Used for locking
+    #[serde(default)]
+    commit: Option<String>,
+    #[serde(default)]
+    skip_merge: bool,
+    #[serde(default)]
+    skip_wast: bool,
+    #[serde(default)]
+    skip_wpt: bool,
+    #[serde(default)]
+    skip_js: bool,
 }
 
 #[derive(Debug)]
@@ -48,9 +71,10 @@ enum Merge {
 
 #[derive(Debug)]
 struct Status {
-    commit: String,
+    commit_base_hash: String,
+    commit_final_message: String,
     merged: Merge,
-    interpreter: bool,
+    built: bool,
 }
 
 #[derive(Debug)]
@@ -143,7 +167,7 @@ fn write_string<P: AsRef<Path>>(path: P, text: &str) -> Result<(), Error> {
 }
 
 fn main() {
-    let config: Config =
+    let mut config: Config =
         toml::from_str(&fs::read_to_string("config.toml").expect("failed to read config.toml"))
             .expect("invalid config.toml");
 
@@ -156,16 +180,32 @@ fn main() {
         println!("@@ {:?}", repo);
 
         match build_repo(repo, &config) {
-            Ok(status) => successes.push((repo, status)),
-            Err(err) => failures.push((repo, err)),
+            Ok(status) => successes.push((repo.name.clone(), status)),
+            Err(err) => failures.push((repo.name.clone(), err)),
         };
     }
-    println!("@@ done");
 
-    let mut results = String::new();
-    for (repo, status) in &successes {
-        write!(
-            results,
+    if !failures.is_empty() {
+        println!("@@ failed!");
+        for (name, err) in &failures {
+            println!("{}: (failure) {:?}", name, err);
+        }
+        std::process::exit(1);
+    }
+
+    println!("@@ done!");
+    for (name, status) in &successes {
+        let repo = config.find_repo_mut(&name).unwrap();
+        repo.commit = Some(status.commit_base_hash.clone());
+        if let Merge::Conflicted = status.merged {
+            repo.skip_merge = true;
+        }
+        if !status.built {
+            repo.skip_js = true;
+            repo.skip_wpt = true;
+        }
+
+        println!(
             "{}: ({} {}) {}",
             repo.name,
             match status.merged {
@@ -173,21 +213,16 @@ fn main() {
                 Merge::Merged => "merged",
                 Merge::Conflicted => "conflicted",
             },
-            if status.interpreter {
+            if status.built {
                 "building"
             } else {
                 "broken"
             },
-            status.commit
-        )
-        .unwrap();
-    }
-    for (repo, err) in &failures {
-        writeln!(results, "{}: (failure) {:?}", repo.name, err).unwrap();
+            status.commit_final_message
+        );
     }
 
-    println!("{}", results);
-    write_string("tests/proposals.lock", &results).unwrap();
+    write_string("tests/config.lock", &toml::to_string_pretty(&config).unwrap()).unwrap();
 }
 
 fn clean() {
@@ -198,20 +233,13 @@ fn clean() {
 
 fn build_repo(repo: &Repo, config: &Config) -> Result<Status, Error> {
     let repo_dir = format!("repos/{}", repo.name);
-    let upstream_commit = repo
-        .commit
-        .as_ref()
-        .map(|x| x.as_str())
-        .unwrap_or("origin/master");
 
     // Initialize repo if it doesn't exist
     if !Path::new(&repo_dir).exists() {
         fs::create_dir(&repo_dir).unwrap();
         if let Some(parent) = &repo.parent {
             let parent = config
-                .repos
-                .iter()
-                .find(|x| &x.name == parent)
+                .find_repo(parent)
                 .expect("invalid parent name");
             let parent_dir = format!("repos/{}", parent.name);
             assert!(Path::new(&parent_dir).exists());
@@ -234,40 +262,47 @@ fn build_repo(repo: &Repo, config: &Config) -> Result<Status, Error> {
     {
         let _cd = change_dir(&repo_dir);
 
-        // Update repo to latest changes
-        run("git", &["checkout", "master"])?;
+        // Fetch the repos latest changes
         run("git", &["fetch", "origin"])?;
-        run("git", &["reset", upstream_commit, "--hard"])?;
 
-        let mut merged = Merge::Unmerged;
-        if let Some(parent) = &repo.parent {
-            if !repo.skip_merge {
-                // Try to merge with master
-                run("git", &["fetch", "parent"])?;
-                run("git", &["checkout", "try-merge"])?;
-                run("git", &["reset", upstream_commit, "--hard"])?;
-                let hash = run("git", &["log", "--pretty=%h", "-n", "1"])?;
-                let message = format!("Merging {}:{}with {}", repo.name, hash, parent);
+        // Checkout the specified commit, if any, and get the absolute commit hash
+        let base_treeish = repo
+            .commit
+            .as_ref()
+            .map(|x| x.as_str())
+            .unwrap_or("origin/master");
+        run("git", &["checkout", "master"])?;
+        run("git", &["reset", base_treeish, "--hard"])?;
+        let commit_base_hash = run("git", &["log", "--pretty=%h", "-n", "1"])?.trim().to_owned();
 
-                // Try to merge and ignore merge conflicts in the document directory.
-                if !run("git", &["merge", "-q", "parent/master", "-m", &message]).is_ok() {
-                    if !run("git", &["checkout", "--ours", "document"]).is_ok()
-                        || !run("git", &["add", "document"]).is_ok()
-                        || !run("git", &["-c", "core.editor=true", "merge", "--continue"]).is_ok()
-                    {
-                        // Reset to master if we failed
-                        println!("! failed to merge {}", repo.name);
-                        run("git", &["merge", "--abort"])?;
-                        run("git", &["reset", upstream_commit, "--hard"])?;
-                        merged = Merge::Conflicted;
-                    } else {
-                        merged = Merge::Merged;
-                    }
+        let merged = if let Some(parent) = repo.parent.as_ref().filter(|_| !repo.skip_merge) {
+            // Try to merge with master
+            run("git", &["fetch", "parent"])?;
+            run("git", &["checkout", "try-merge"])?;
+            run("git", &["reset", &commit_base_hash, "--hard"])?;
+
+            // Try to merge
+            let message = format!("Merging {}:{}with {}", repo.name, commit_base_hash, parent);
+            if !run("git", &["merge", "-q", "parent/master", "-m", &message]).is_ok() {
+                // Ignore merge conflicts in the document directory.
+                if !run("git", &["checkout", "--ours", "document"]).is_ok()
+                    || !run("git", &["add", "document"]).is_ok()
+                    || !run("git", &["-c", "core.editor=true", "merge", "--continue"]).is_ok()
+                {
+                    // Reset to master if we failed
+                    println!("! failed to merge {}", repo.name);
+                    run("git", &["merge", "--abort"])?;
+                    run("git", &["reset", &commit_base_hash, "--hard"])?;
+                    Merge::Conflicted
                 } else {
-                    merged = Merge::Merged;
+                    Merge::Merged
                 }
+            } else {
+                Merge::Merged
             }
-        }
+        } else {
+            Merge::Unmerged
+        };
 
         // Build tests
         let build_tests = || {
@@ -279,21 +314,21 @@ fn build_repo(repo: &Repo, config: &Config) -> Result<Status, Error> {
             )
         };
 
-        let mut interpreter = true;
+        let mut built = true;
         if build_tests().is_err() {
             if repo.parent.is_some() {
                 println!("@@ failed to compile, trying again on master/pinned commit");
-                run("git", &["reset", upstream_commit, "--hard"])?;
-                interpreter = build_tests().is_ok();
+                run("git", &["reset", &commit_base_hash, "--hard"])?;
+                built = build_tests().is_ok();
             } else {
-                interpreter = false;
+                built = false;
             }
         }
 
         // Get the final commit message we ended up on
-        let commit = run("git", &["log", "--oneline", "-n", "1"])?;
+        let commit_final_message = run("git", &["log", "--oneline", "-n", "1"])?;
 
-        if !interpreter {
+        if !built {
             println!("@@ failed to compile, won't emit js/html");
         }
 
@@ -350,9 +385,13 @@ fn build_repo(repo: &Repo, config: &Config) -> Result<Status, Error> {
             }
         };
 
-        copy_tests("test/core", "wast");
-        if interpreter {
+        if !repo.skip_wast {
+            copy_tests("test/core", "wast");
+        }
+        if built && !repo.skip_wpt {
             copy_tests("wpt", "wpt");
+        }
+        if built && !repo.skip_js {                
             copy_tests("js", "js");
 
             // Write directives files
@@ -362,7 +401,6 @@ fn build_repo(repo: &Repo, config: &Config) -> Result<Status, Error> {
                     .join("harness/directives.txt");
                 write_string(&directives_path, harness_directive)?;
             }
-
             let directives = format!(
                 "{}{}",
                 config.directive.as_ref().map(|x| x.as_str()).unwrap_or(""),
@@ -377,9 +415,10 @@ fn build_repo(repo: &Repo, config: &Config) -> Result<Status, Error> {
         }
 
         Ok(Status {
-            commit,
+            commit_final_message,
+            commit_base_hash,
             merged,
-            interpreter,
+            built,
         })
     }
 }
