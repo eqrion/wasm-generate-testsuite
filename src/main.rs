@@ -331,8 +331,11 @@ fn build_repo(repo: &Repo, config: &Config) -> Result<Status, Error> {
         // one of those is different from the master.
         let mut included_files = Vec::new();
         for test_path in find("test/core") {
-            let test_name = test_path.file_name().unwrap().to_str().unwrap().to_owned();
+            if test_path.extension().map(|x| x.to_str().unwrap()) != Some("wast") {
+                continue;
+            }
 
+            let test_name = test_path.file_name().unwrap().to_str().unwrap().to_owned();
             if let Some(parent) = &repo.parent {
                 let parent_test_path = Path::new("../").join(parent).join(&test_path);
                 if diff(&test_path, &parent_test_path) {
