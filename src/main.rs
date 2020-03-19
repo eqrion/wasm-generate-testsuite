@@ -28,6 +28,12 @@ impl Config {
     fn find_repo_mut(&mut self, name: &str) -> Option<&mut Repo> {
         self.repos.iter_mut().find(|x| &x.name == name)
     }
+
+    fn unlock_commits(&mut self) {
+        for repo in &mut self.repos {
+            repo.unlock_commits();
+        }
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -42,10 +48,6 @@ struct Repo {
     included_tests: Vec<String>,
     #[serde(default)]
     excluded_tests: Vec<String>,
-
-    // Used for locking
-    #[serde(default)]
-    commit: Option<String>,
     #[serde(default)]
     skip_merge: bool,
     #[serde(default)]
@@ -54,6 +56,16 @@ struct Repo {
     skip_wpt: bool,
     #[serde(default)]
     skip_js: bool,
+
+    // Used for locking
+    #[serde(default)]
+    commit: Option<String>,
+}
+
+impl Repo {
+    fn unlock_commits(&mut self) {
+        self.commit = None;
+    }
 }
 
 #[derive(Debug)]
@@ -164,6 +176,10 @@ fn main() {
         toml::from_str(&fs::read_to_string("config.toml").expect("failed to read config.toml"))
             .expect("invalid config.toml");
 
+    if env::var("WASM_UNLOCK_COMMITS").is_ok() {
+        config.unlock_commits();
+    }
+
     clean();
 
     let mut successes = Vec::new();
@@ -190,13 +206,6 @@ fn main() {
     for (name, status) in &successes {
         let repo = config.find_repo_mut(&name).unwrap();
         repo.commit = Some(status.commit_base_hash.clone());
-        if let Merge::Conflicted = status.merged {
-            repo.skip_merge = true;
-        }
-        if !status.built {
-            repo.skip_js = true;
-            repo.skip_wpt = true;
-        }
 
         println!(
             "{}: ({} {}) {}",
@@ -212,7 +221,7 @@ fn main() {
     }
 
     write_string(
-        "tests/config.lock",
+        "config-lock.toml",
         &toml::to_string_pretty(&config).unwrap(),
     )
     .unwrap();
