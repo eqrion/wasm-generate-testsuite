@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use regex::RegexSetBuilder;
-use serde_derive::{Serialize, Deserialize};
+use serde_derive::{Deserialize, Serialize};
 use toml;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -22,17 +22,11 @@ struct Config {
 
 impl Config {
     fn find_repo(&self, name: &str) -> Option<&Repo> {
-        self
-            .repos
-            .iter()
-            .find(|x| &x.name == name)
+        self.repos.iter().find(|x| &x.name == name)
     }
 
     fn find_repo_mut(&mut self, name: &str) -> Option<&mut Repo> {
-        self
-            .repos
-            .iter_mut()
-            .find(|x| &x.name == name)
+        self.repos.iter_mut().find(|x| &x.name == name)
     }
 }
 
@@ -212,16 +206,16 @@ fn main() {
                 Merge::Merged => "merged",
                 Merge::Conflicted => "conflicted",
             },
-            if status.built {
-                "building"
-            } else {
-                "broken"
-            },
+            if status.built { "building" } else { "broken" },
             status.commit_final_message
         );
     }
 
-    write_string("tests/config.lock", &toml::to_string_pretty(&config).unwrap()).unwrap();
+    write_string(
+        "tests/config.lock",
+        &toml::to_string_pretty(&config).unwrap(),
+    )
+    .unwrap();
 }
 
 fn clean() {
@@ -237,9 +231,7 @@ fn build_repo(repo: &Repo, config: &Config) -> Result<Status, Error> {
     if !Path::new(&repo_dir).exists() {
         fs::create_dir(&repo_dir).unwrap();
         if let Some(parent) = &repo.parent {
-            let parent = config
-                .find_repo(parent)
-                .expect("invalid parent name");
+            let parent = config.find_repo(parent).expect("invalid parent name");
             let parent_dir = format!("repos/{}", parent.name);
             assert!(Path::new(&parent_dir).exists());
 
@@ -272,7 +264,9 @@ fn build_repo(repo: &Repo, config: &Config) -> Result<Status, Error> {
             .unwrap_or("origin/master");
         run("git", &["checkout", "master"])?;
         run("git", &["reset", base_treeish, "--hard"])?;
-        let commit_base_hash = run("git", &["log", "--pretty=%h", "-n", "1"])?.trim().to_owned();
+        let commit_base_hash = run("git", &["log", "--pretty=%h", "-n", "1"])?
+            .trim()
+            .to_owned();
 
         let merged = if let Some(parent) = repo.parent.as_ref().filter(|_| !repo.skip_merge) {
             // Try to merge with master
@@ -390,7 +384,7 @@ fn build_repo(repo: &Repo, config: &Config) -> Result<Status, Error> {
         if built && !repo.skip_wpt {
             copy_tests("wpt", "wpt");
         }
-        if built && !repo.skip_js {                
+        if built && !repo.skip_js {
             copy_tests("js", "js");
 
             // Write directives files
