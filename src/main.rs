@@ -49,8 +49,6 @@ struct Repo {
     #[serde(default)]
     excluded_tests: Vec<String>,
     #[serde(default)]
-    skip_merge: bool,
-    #[serde(default)]
     skip_wast: bool,
     #[serde(default)]
     skip_wpt: bool,
@@ -277,7 +275,7 @@ fn build_repo(repo: &Repo, config: &Config) -> Result<Status, Error> {
             .trim()
             .to_owned();
 
-        let merged = if let Some(parent) = repo.parent.as_ref().filter(|_| !repo.skip_merge) {
+        let merged = if let Some(parent) = repo.parent.as_ref() {
             // Try to merge with master
             run("git", &["fetch", "parent"])?;
             run("git", &["checkout", "try-merge"])?;
