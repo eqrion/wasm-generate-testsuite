@@ -140,10 +140,9 @@ fn find(dir: &str) -> Vec<PathBuf> {
 
             if entry.file_type().unwrap().is_dir() {
                 find(path.to_str().unwrap(), paths);
-                return;
+            } else {
+                paths.push(path);
             }
-
-            paths.push(path);
         }
     }
 
