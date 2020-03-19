@@ -28,12 +28,6 @@ impl Config {
     fn find_repo_mut(&mut self, name: &str) -> Option<&mut Repo> {
         self.repos.iter_mut().find(|x| &x.name == name)
     }
-
-    fn unlock_commits(&mut self) {
-        for repo in &mut self.repos {
-            repo.unlock_commits();
-        }
-    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -54,16 +48,37 @@ struct Repo {
     skip_wpt: bool,
     #[serde(default)]
     skip_js: bool,
-
-    // Used for locking
-    #[serde(default)]
-    commit: Option<String>,
 }
 
-impl Repo {
-    fn unlock_commits(&mut self) {
-        self.commit = None;
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Lock {
+    repos: Vec<LockRepo>,
+}
+
+impl Lock {
+    fn find_commit(&self, name: &str) -> Option<&str> {
+        self.repos
+            .iter()
+            .find(|x| &x.name == name)
+            .map(|x| x.commit.as_ref())
     }
+
+    fn set_commit(&mut self, name: &str, commit: &str) {
+        if let Some(lock) = self.repos.iter_mut().find(|x| &x.name == name) {
+            lock.commit = commit.to_owned();
+        } else {
+            self.repos.push(LockRepo {
+                name: name.to_owned(),
+                commit: commit.to_owned(),
+            });
+        }
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct LockRepo {
+    name: String,
+    commit: String,
 }
 
 #[derive(Debug)]
@@ -173,10 +188,14 @@ fn main() {
     let mut config: Config =
         toml::from_str(&fs::read_to_string("config.toml").expect("failed to read config.toml"))
             .expect("invalid config.toml");
-
-    if env::var("WASM_UNLOCK_COMMITS").is_ok() {
-        config.unlock_commits();
-    }
+    let mut lock: Lock = if Path::new("config-lock.toml").exists() {
+        toml::from_str(
+            &fs::read_to_string("config-lock.toml").expect("failed to read config-lock.toml"),
+        )
+        .expect("invalid config-lock.toml")
+    } else {
+        Lock::default()
+    };
 
     clean();
 
@@ -186,7 +205,7 @@ fn main() {
     for repo in &config.repos {
         println!("@@ {:?}", repo);
 
-        match build_repo(repo, &config) {
+        match build_repo(repo, &config, &lock) {
             Ok(status) => successes.push((repo.name.clone(), status)),
             Err(err) => failures.push((repo.name.clone(), err)),
         };
@@ -203,7 +222,7 @@ fn main() {
     println!("@@ done!");
     for (name, status) in &successes {
         let repo = config.find_repo_mut(&name).unwrap();
-        repo.commit = Some(status.commit_base_hash.clone());
+        lock.set_commit(&name, &status.commit_base_hash);
 
         println!(
             "{}: ({} {}) {}",
@@ -218,11 +237,7 @@ fn main() {
         );
     }
 
-    write_string(
-        "config-lock.toml",
-        &toml::to_string_pretty(&config).unwrap(),
-    )
-    .unwrap();
+    write_string("config-lock.toml", &toml::to_string_pretty(&lock).unwrap()).unwrap();
 }
 
 fn clean() {
@@ -231,7 +246,7 @@ fn clean() {
     let _ = fs::remove_dir_all("./tests");
 }
 
-fn build_repo(repo: &Repo, config: &Config) -> Result<Status, Error> {
+fn build_repo(repo: &Repo, config: &Config, lock: &Lock) -> Result<Status, Error> {
     let repo_dir = format!("repos/{}", repo.name);
 
     // Initialize repo if it doesn't exist
@@ -264,11 +279,7 @@ fn build_repo(repo: &Repo, config: &Config) -> Result<Status, Error> {
         run("git", &["fetch", "origin"])?;
 
         // Checkout the specified commit, if any, and get the absolute commit hash
-        let base_treeish = repo
-            .commit
-            .as_ref()
-            .map(|x| x.as_str())
-            .unwrap_or("origin/master");
+        let base_treeish = lock.find_commit(&repo.name).unwrap_or("origin/master");
         run("git", &["checkout", "master"])?;
         run("git", &["reset", base_treeish, "--hard"])?;
         let commit_base_hash = run("git", &["log", "--pretty=%h", "-n", "1"])?
