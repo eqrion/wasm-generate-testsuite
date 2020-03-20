@@ -3,3 +3,4 @@
 repos/
 tests/
 config.toml
+config-lock.toml
