@@ -120,10 +120,14 @@ impl From<std::string::FromUtf8Error> for Error {
 fn run(name: &str, args: &[&str]) -> Result<String, Error> {
     debug!("{} {:?}", name, args);
     let output = Command::new(name).args(args).output()?;
-    let stdout = String::from_utf8(output.stdout)?;
-    let stderr = String::from_utf8(output.stderr)?;
-    debug!("{}", stdout);
-    debug!("{}", stderr);
+    let stdout = String::from_utf8(output.stdout)?.trim().to_owned();
+    let stderr = String::from_utf8(output.stderr)?.trim().to_owned();
+    if !stdout.is_empty() {
+        debug!("{}", stdout);
+    }
+    if !stderr.is_empty() {
+        debug!("{}", stderr);
+    }
 
     if output.status.success() {
         Ok(stdout)
@@ -302,9 +306,11 @@ fn build_repo(repo: &Repo, config: &Config, lock: &Lock) -> Result<Status, Error
             run("git", &["reset", &commit_base_hash, "--hard"])?;
             built = try_build_tests().is_ok();
         } else {
-            warn!("Failed to build interpreter, Won't emit js/html");
             built = false;
         }
+    }
+    if !built {
+        warn!("Failed to build interpreter, Won't emit js/html");
     }
 
     // Get the final commit message we ended up on
