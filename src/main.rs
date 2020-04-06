@@ -7,6 +7,10 @@ use regex::RegexSetBuilder;
 use serde_derive::{Deserialize, Serialize};
 use toml;
 
+use log::{debug, info, warn};
+
+// Data structures
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Config {
     #[serde(default)]
@@ -79,7 +83,7 @@ struct LockRepo {
 
 #[derive(Debug)]
 enum Merge {
-    Unmerged,
+    Standalone,
     Merged,
     Conflicted,
 }
@@ -91,6 +95,8 @@ struct Status {
     merged: Merge,
     built: bool,
 }
+
+// Roll-your-own CLI utilities
 
 #[derive(Debug)]
 enum Error {
@@ -112,13 +118,13 @@ impl From<std::string::FromUtf8Error> for Error {
 }
 
 fn run(name: &str, args: &[&str]) -> Result<String, Error> {
-    println!("@ {} {:?}", name, args);
+    debug!("{} {:?}", name, args);
     let output = Command::new(name).args(args).output()?;
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
+    debug!("{}", stdout);
+    debug!("{}", stderr);
 
-    print!("{}", stdout);
-    eprint!("{}", stderr);
     if output.status.success() {
         Ok(stdout)
     } else {
@@ -133,7 +139,7 @@ fn change_dir(dir: &str) -> impl Drop {
     }
     impl Drop for Reset {
         fn drop(&mut self) {
-            println!("@ cd {}", self.previous.display());
+            debug!("cd {}", self.previous.display());
             env::set_current_dir(&self.previous).unwrap()
         }
     }
@@ -141,7 +147,7 @@ fn change_dir(dir: &str) -> impl Drop {
     let previous = Reset {
         previous: env::current_dir().unwrap(),
     };
-    println!("@ cd {}", dir);
+    debug!("cd {}", dir);
     env::set_current_dir(dir).unwrap();
     previous
 }
@@ -173,9 +179,11 @@ fn write_string<P: AsRef<Path>>(path: P, text: &str) -> Result<(), Error> {
     Ok(())
 }
 
-const SPECS_DIR: &str = "specs/";
+// The main script
 
 fn main() {
+    env_logger::init();
+
     let mut config: Config =
         toml::from_str(&fs::read_to_string("config.toml").expect("failed to read config.toml"))
             .expect("invalid config.toml");
@@ -188,18 +196,20 @@ fn main() {
         Lock::default()
     };
 
-    clean();
+    let specs_dir = "specs/";
 
-    if !Path::new(SPECS_DIR).exists() {
-        fs::create_dir(SPECS_DIR).unwrap();
-        run("git", &["-C", SPECS_DIR, "init"]).unwrap();
+    let _ = fs::remove_dir_all("./tests");
+    if !Path::new(specs_dir).exists() {
+        fs::create_dir(specs_dir).unwrap();
+        run("git", &["-C", specs_dir, "init"]).unwrap();
     }
+    let _cd = change_dir(specs_dir);
 
     let mut successes = Vec::new();
     let mut failures = Vec::new();
 
     for repo in &config.repos {
-        println!("@@ {:?}", repo);
+        info!("Processing {:#?}", repo);
 
         match build_repo(repo, &config, &lock) {
             Ok(status) => successes.push((repo.name.clone(), status)),
@@ -208,42 +218,35 @@ fn main() {
     }
 
     if !failures.is_empty() {
-        println!("@@ failed!");
+        warn!("Failed.");
         for (name, err) in &failures {
-            println!("{}: (failure) {:?}", name, err);
+            warn!("{}: (failure) {:?}", name, err);
         }
         std::process::exit(1);
     }
 
-    println!("@@ done!");
+    info!("Done.");
     for (name, status) in &successes {
         let repo = config.find_repo_mut(&name).unwrap();
         lock.set_commit(&name, &status.commit_base_hash);
 
-        println!(
+        info!(
             "{}: ({} {}) {}",
             repo.name,
             match status.merged {
-                Merge::Unmerged => "unmerged",
+                Merge::Standalone => "standalone",
                 Merge::Merged => "merged",
                 Merge::Conflicted => "conflicted",
             },
             if status.built { "building" } else { "broken" },
-            status.commit_final_message
+            status.commit_final_message.trim_end()
         );
     }
 
     write_string("config-lock.toml", &toml::to_string_pretty(&lock).unwrap()).unwrap();
 }
 
-fn clean() {
-    println!("@@ clean");
-    let _ = fs::remove_dir_all("./tests");
-}
-
 fn build_repo(repo: &Repo, config: &Config, lock: &Lock) -> Result<Status, Error> {
-    let _cd = change_dir(SPECS_DIR);
-
     let remote_name = &repo.name;
     let remote_url = &repo.url;
     let branch_upstream = format!("{}/master", repo.name);
@@ -284,7 +287,10 @@ fn build_repo(repo: &Repo, config: &Config, lock: &Lock) -> Result<Status, Error
                 || !run("git", &["-c", "core.editor=true", "merge", "--continue"]).is_ok()
             {
                 // Reset to master if we failed
-                println!("! failed to merge {}", repo.name);
+                warn!(
+                    "Failed to merge {}, falling back to {}.",
+                    repo.name, &commit_base_hash
+                );
                 run("git", &["merge", "--abort"])?;
                 run("git", &["reset", &commit_base_hash, "--hard"])?;
                 Merge::Conflicted
@@ -295,7 +301,7 @@ fn build_repo(repo: &Repo, config: &Config, lock: &Lock) -> Result<Status, Error
             Merge::Merged
         }
     } else {
-        Merge::Unmerged
+        Merge::Standalone
     };
 
     // Try to build the test suite on this commit. This may fail due to merging
@@ -312,11 +318,14 @@ fn build_repo(repo: &Repo, config: &Config, lock: &Lock) -> Result<Status, Error
     let mut built = true;
     if build_tests().is_err() {
         if repo.parent.is_some() {
-            println!("@@ failed to compile, trying again on master/pinned commit");
+            warn!(
+                "Failed to build interpreter. Retrying on unmerged commit ({})",
+                &commit_base_hash
+            );
             run("git", &["reset", &commit_base_hash, "--hard"])?;
             built = build_tests().is_ok();
         } else {
-            println!("@@ failed to compile, won't emit js/html");
+            warn!("Failed to build interpreter, Won't emit js/html");
             built = false;
         }
     }
@@ -349,7 +358,7 @@ fn build_repo(repo: &Repo, config: &Config, lock: &Lock) -> Result<Status, Error
         let test_name = test_path.file_name().unwrap().to_str().unwrap().to_owned();
         included_files.push(test_name);
     }
-    println!("@@ changed files {:?}", included_files);
+    info!("Changed files {:#?}", included_files);
 
     // Include the harness/ directory unconditionally
     included_files.push("harness/".to_owned());
