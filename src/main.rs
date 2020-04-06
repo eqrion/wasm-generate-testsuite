@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use regex::RegexSetBuilder;
+use regex::{RegexSet, RegexSetBuilder};
 use serde_derive::{Deserialize, Serialize};
 use toml;
 
@@ -184,9 +184,12 @@ fn write_string<P: AsRef<Path>>(path: P, text: &str) -> Result<(), Error> {
 fn main() {
     env_logger::init();
 
+    // Load the config
     let mut config: Config =
         toml::from_str(&fs::read_to_string("config.toml").expect("failed to read config.toml"))
             .expect("invalid config.toml");
+
+    // Load the lock file, or default to no pinned commits
     let mut lock: Lock = if Path::new("config-lock.toml").exists() {
         toml::from_str(
             &fs::read_to_string("config-lock.toml").expect("failed to read config-lock.toml"),
@@ -196,18 +199,16 @@ fn main() {
         Lock::default()
     };
 
+    // Clean old tests and initialize the repo if it doesn't exist
     let specs_dir = "specs/";
+    clean_and_init_dirs(specs_dir);
 
-    let _ = fs::remove_dir_all("./tests");
-    if !Path::new(specs_dir).exists() {
-        fs::create_dir(specs_dir).unwrap();
-        run("git", &["-C", specs_dir, "init"]).unwrap();
-    }
+    // Change to the `specs/` dir where all the work happens
     let _cd = change_dir(specs_dir);
 
+    // Generate the tests
     let mut successes = Vec::new();
     let mut failures = Vec::new();
-
     for repo in &config.repos {
         info!("Processing {:#?}", repo);
 
@@ -217,6 +218,7 @@ fn main() {
         };
     }
 
+    // Abort if we had a failure
     if !failures.is_empty() {
         warn!("Failed.");
         for (name, err) in &failures {
@@ -225,6 +227,7 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Display successful results
     info!("Done.");
     for (name, status) in &successes {
         let repo = config.find_repo_mut(&name).unwrap();
@@ -243,7 +246,17 @@ fn main() {
         );
     }
 
+    // Commit the new lock file
     write_string("config-lock.toml", &toml::to_string_pretty(&lock).unwrap()).unwrap();
+}
+
+fn clean_and_init_dirs(specs_dir: &str) {
+    if !Path::new(specs_dir).exists() {
+        fs::create_dir(specs_dir).unwrap();
+        run("git", &["-C", specs_dir, "init"]).unwrap();
+    }
+
+    let _ = fs::remove_dir_all("./tests");
 }
 
 fn build_repo(repo: &Repo, config: &Config, lock: &Lock) -> Result<Status, Error> {
@@ -275,11 +288,80 @@ fn build_repo(repo: &Repo, config: &Config, lock: &Lock) -> Result<Status, Error
         .to_owned();
 
     // Try to merge with parent repo, if specified
-    let merged = if let Some(parent) = repo.parent.as_ref() {
-        run("git", &["fetch", parent])?;
+    let merged = try_merge_parent(repo, &commit_base_hash)?;
 
-        // Try to merge
-        let message = format!("Merging {}:{}with {}", repo.name, commit_base_hash, parent);
+    // Try to build the test suite on this commit. This may fail due to merging
+    // with a parent repo, in which case we will try again in an unmerged state.
+    let mut built = true;
+    if try_build_tests().is_err() {
+        if repo.parent.is_some() {
+            warn!(
+                "Failed to build interpreter. Retrying on unmerged commit ({})",
+                &commit_base_hash
+            );
+            run("git", &["reset", &commit_base_hash, "--hard"])?;
+            built = try_build_tests().is_ok();
+        } else {
+            warn!("Failed to build interpreter, Won't emit js/html");
+            built = false;
+        }
+    }
+
+    // Get the final commit message we ended up on
+    let commit_final_message = run("git", &["log", "--oneline", "-n", "1"])?;
+
+    // Compute the source files that changed, and use that to filter the files
+    // we copy over. We can't compare the generated tests, because for a
+    // generated WPT we need to copy both the .js and .html even if only
+    // one of those is different from the master.
+    let tests_changed = find_tests_changed(repo)?;
+    info!("Changed tests: {:#?}", tests_changed);
+
+    // Include the changed tests, specified files, and `harness/` directory
+    let mut included_files = Vec::new();
+    included_files.extend_from_slice(&tests_changed);
+    included_files.extend_from_slice(&config.included_tests);
+    included_files.extend_from_slice(&repo.included_tests);
+    included_files.push("harness/".to_owned());
+
+    // Exclude files specified from the config and repo
+    let mut excluded_files = Vec::new();
+    excluded_files.extend_from_slice(&config.excluded_tests);
+    excluded_files.extend_from_slice(&repo.excluded_tests);
+
+    // Generate a regex set of the files to include or exclude
+    let include = RegexSetBuilder::new(&included_files).build().unwrap();
+    let exclude = RegexSetBuilder::new(&excluded_files).build().unwrap();
+
+    // Copy over all the desired test-suites
+    if !repo.skip_wast {
+        copy_tests(repo, "test/core", "../tests", "wast", &include, &exclude);
+    }
+    if built && !repo.skip_wpt {
+        copy_tests(repo, "wpt", "../tests", "wpt", &include, &exclude);
+    }
+    if built && !repo.skip_js {
+        copy_tests(repo, "js", "../tests", "js", &include, &exclude);
+        copy_directives(repo, config)?;
+    }
+
+    Ok(Status {
+        commit_final_message,
+        commit_base_hash,
+        merged,
+        built,
+    })
+}
+
+fn try_merge_parent(repo: &Repo, commit_base_hash: &str) -> Result<Merge, Error> {
+    if !repo.parent.is_some() {
+        return Ok(Merge::Standalone);
+    }
+    let parent = repo.parent.as_ref().unwrap();
+
+    // Try to merge with the parent branch.
+    let message = format!("Merging {}:{}with {}", repo.name, commit_base_hash, parent);
+    Ok(
         if !run("git", &["merge", "-q", parent, "-m", &message]).is_ok() {
             // Ignore merge conflicts in the document directory.
             if !run("git", &["checkout", "--ours", "document"]).is_ok()
@@ -299,49 +381,73 @@ fn build_repo(repo: &Repo, config: &Config, lock: &Lock) -> Result<Status, Error
             }
         } else {
             Merge::Merged
-        }
-    } else {
-        Merge::Standalone
-    };
+        },
+    )
+}
 
-    // Try to build the test suite on this commit. This may fail due to merging
-    // with a parent repo, in which case we will try again in an unmerged state.
-    let build_tests = || {
-        let _ = fs::remove_dir_all("./js");
-        let _ = fs::remove_dir_all("./wpt");
-        run(
-            "test/build.py",
-            &["--use-sync", "--js", "./js", "--html", "./wpt"],
-        )
-    };
+fn try_build_tests() -> Result<(), Error> {
+    let _ = fs::remove_dir_all("./js");
+    let _ = fs::remove_dir_all("./wpt");
+    run(
+        "test/build.py",
+        &["--use-sync", "--js", "./js", "--html", "./wpt"],
+    )?;
+    Ok(())
+}
 
-    let mut built = true;
-    if build_tests().is_err() {
-        if repo.parent.is_some() {
-            warn!(
-                "Failed to build interpreter. Retrying on unmerged commit ({})",
-                &commit_base_hash
-            );
-            run("git", &["reset", &commit_base_hash, "--hard"])?;
-            built = build_tests().is_ok();
-        } else {
-            warn!("Failed to build interpreter, Won't emit js/html");
-            built = false;
+fn copy_tests(
+    repo: &Repo,
+    src_dir: &str,
+    dst_dir: &str,
+    test_name: &str,
+    include: &RegexSet,
+    exclude: &RegexSet,
+) {
+    for path in find(src_dir) {
+        let stripped_path = path.strip_prefix(src_dir).unwrap();
+        let stripped_path_str = stripped_path.to_str().unwrap();
+
+        if !include.is_match(stripped_path_str) || exclude.is_match(stripped_path_str) {
+            continue;
         }
+
+        let out_path = Path::new(dst_dir)
+            .join(test_name)
+            .join(&repo.name)
+            .join(&stripped_path);
+        let out_dir = out_path.parent().unwrap();
+        let _ = fs::create_dir_all(out_dir);
+        fs::copy(path, out_path).unwrap();
     }
+}
 
-    // Get the final commit message we ended up on
-    let commit_final_message = run("git", &["log", "--oneline", "-n", "1"])?;
+fn copy_directives(repo: &Repo, config: &Config) -> Result<(), Error> {
+    // Write directives files
+    if let Some(harness_directive) = &config.harness_directive {
+        let directives_path = Path::new("../tests/js")
+            .join(&repo.name)
+            .join("harness/directives.txt");
+        write_string(&directives_path, harness_directive)?;
+    }
+    let directives = format!(
+        "{}{}",
+        config.directive.as_ref().map(|x| x.as_str()).unwrap_or(""),
+        repo.directive.as_ref().map(|x| x.as_str()).unwrap_or("")
+    );
+    if !directives.is_empty() {
+        let directives_path = Path::new("../tests/js")
+            .join(&repo.name)
+            .join("directives.txt");
+        write_string(&directives_path, &directives)?;
+    }
+    Ok(())
+}
 
-    // Compute the source files that changed, use that filter the files we
-    // copy over. We can't compare the generated tests, because for a
-    // generated WPT we need to copy both the .js and .html even if only
-    // one of those is different from the master.
-    let mut included_files = Vec::new();
-    let tests_changed = if let Some(parent) = repo.parent.as_ref() {
+fn find_tests_changed(repo: &Repo) -> Result<Vec<String>, Error> {
+    let files_changed = if let Some(parent) = repo.parent.as_ref() {
         run(
             "git",
-            &["diff", "--name-only", &branch_base, &parent, "test/core"],
+            &["diff", "--name-only", &repo.name, &parent, "test/core"],
         )?
         .lines()
         .map(|x| PathBuf::from(x))
@@ -350,81 +456,14 @@ fn build_repo(repo: &Repo, config: &Config, lock: &Lock) -> Result<Status, Error
         find("test/core")
     };
 
-    for test_path in tests_changed {
-        if test_path.extension().map(|x| x.to_str().unwrap()) != Some("wast") {
+    let mut tests_changed = Vec::new();
+    for path in files_changed {
+        if path.extension().map(|x| x.to_str().unwrap()) != Some("wast") {
             continue;
         }
 
-        let test_name = test_path.file_name().unwrap().to_str().unwrap().to_owned();
-        included_files.push(test_name);
+        let name = path.file_name().unwrap().to_str().unwrap().to_owned();
+        tests_changed.push(name);
     }
-    info!("Changed files {:#?}", included_files);
-
-    // Include the harness/ directory unconditionally
-    included_files.push("harness/".to_owned());
-    // Also include manually specified files
-    included_files.extend_from_slice(&repo.included_tests);
-
-    // Exclude files specified from the config and repo
-    let mut excluded_files = Vec::new();
-    excluded_files.extend_from_slice(&config.excluded_tests);
-    excluded_files.extend_from_slice(&repo.excluded_tests);
-
-    // Generate a regex set of the files to include or exclude
-    let include = RegexSetBuilder::new(&included_files).build().unwrap();
-    let exclude = RegexSetBuilder::new(&excluded_files).build().unwrap();
-
-    let copy_tests = |src_dir, dst_dir, test_name| {
-        for path in find(src_dir) {
-            let path_str = path.to_str().unwrap();
-
-            if !include.is_match(path_str) || exclude.is_match(path_str) {
-                continue;
-            }
-
-            let out_path = Path::new(dst_dir)
-                .join(test_name)
-                .join(&repo.name)
-                .join(&path);
-            let out_dir = out_path.parent().unwrap();
-            let _ = fs::create_dir_all(out_dir);
-            fs::copy(path, out_path).unwrap();
-        }
-    };
-
-    if !repo.skip_wast {
-        copy_tests("test/core", "../tests", "wast");
-    }
-    if built && !repo.skip_wpt {
-        copy_tests("wpt", "../tests", "wpt");
-    }
-    if built && !repo.skip_js {
-        copy_tests("js", "../tests", "js");
-
-        // Write directives files
-        if let Some(harness_directive) = &config.harness_directive {
-            let directives_path = Path::new("../tests/js")
-                .join(&repo.name)
-                .join("harness/directives.txt");
-            write_string(&directives_path, harness_directive)?;
-        }
-        let directives = format!(
-            "{}{}",
-            config.directive.as_ref().map(|x| x.as_str()).unwrap_or(""),
-            repo.directive.as_ref().map(|x| x.as_str()).unwrap_or("")
-        );
-        if !directives.is_empty() {
-            let directives_path = Path::new("../tests/js")
-                .join(&repo.name)
-                .join("directives.txt");
-            write_string(&directives_path, &directives)?;
-        }
-    }
-
-    Ok(Status {
-        commit_final_message,
-        commit_base_hash,
-        merged,
-        built,
-    })
+    Ok(tests_changed)
 }
