@@ -1,6 +1,6 @@
 /target
 **/*.rs.bk
-repos/
+specs/
 tests/
 config.toml
 config-lock.toml
