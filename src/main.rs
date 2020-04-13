@@ -177,8 +177,9 @@ fn find(dir: &str) -> Vec<PathBuf> {
 
 fn write_string<P: AsRef<Path>>(path: P, text: &str) -> Result<(), Error> {
     let path = path.as_ref();
-    let dir = path.parent().unwrap();
-    let _ = fs::create_dir_all(dir);
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
     fs::write(path, text.as_bytes())?;
     Ok(())
 }
@@ -207,19 +208,20 @@ fn main() {
     let specs_dir = "specs/";
     clean_and_init_dirs(specs_dir);
 
-    // Change to the `specs/` dir where all the work happens
-    let _cd = change_dir(specs_dir);
-
     // Generate the tests
     let mut successes = Vec::new();
     let mut failures = Vec::new();
-    for repo in &config.repos {
-        info!("Processing {:#?}", repo);
+    {
+        // Change to the `specs/` dir where all the work happens
+        let _cd = change_dir(specs_dir);
+        for repo in &config.repos {
+            info!("Processing {:#?}", repo);
 
-        match build_repo(repo, &config, &lock) {
-            Ok(status) => successes.push((repo.name.clone(), status)),
-            Err(err) => failures.push((repo.name.clone(), err)),
-        };
+            match build_repo(repo, &config, &lock) {
+                Ok(status) => successes.push((repo.name.clone(), status)),
+                Err(err) => failures.push((repo.name.clone(), err)),
+            };
+        }
     }
 
     // Abort if we had a failure
