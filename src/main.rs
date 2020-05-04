@@ -35,6 +35,8 @@ struct Repo {
     name: String,
     url: String,
     #[serde(default)]
+    branch: Option<String>,
+    #[serde(default)]
     parent: Option<String>,
     #[serde(default)]
     directive: Option<String>,
@@ -268,7 +270,8 @@ fn clean_and_init_dirs(specs_dir: &str) {
 fn build_repo(repo: &Repo, config: &Config, lock: &Lock) -> Result<Status, Error> {
     let remote_name = &repo.name;
     let remote_url = &repo.url;
-    let branch_upstream = format!("{}/master", repo.name);
+    let remote_branch = repo.branch.as_ref().map(|x| x.as_str()).unwrap_or("master");
+    let branch_upstream = format!("{}/{}", repo.name, remote_branch);
     let branch_base = repo.name.clone();
 
     // Initialize our remote and branches if they don't exist
@@ -278,9 +281,12 @@ fn build_repo(repo: &Repo, config: &Config, lock: &Lock) -> Result<Status, Error
         run("git", &["fetch", remote_name])?;
         run(
             "git",
-            &["branch", "--track", &branch_base, &branch_upstream],
+            &["branch", &branch_base],
         )?;
     }
+
+    // Set the upstream to the correct branch
+    run("git", &["branch", &branch_base, "--set-upstream-to", &branch_upstream])?;
 
     // Fetch the latest changes for this repo
     run("git", &["fetch", remote_name])?;
