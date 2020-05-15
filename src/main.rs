@@ -279,14 +279,19 @@ fn build_repo(repo: &Repo, config: &Config, lock: &Lock) -> Result<Status, Error
     if !remotes.lines().any(|x| x == repo.name) {
         run("git", &["remote", "add", remote_name, &remote_url])?;
         run("git", &["fetch", remote_name])?;
-        run(
-            "git",
-            &["branch", &branch_base],
-        )?;
+        run("git", &["branch", &branch_base, &branch_upstream])?;
     }
 
     // Set the upstream to the correct branch
-    run("git", &["branch", &branch_base, "--set-upstream-to", &branch_upstream])?;
+    run(
+        "git",
+        &[
+            "branch",
+            &branch_base,
+            "--set-upstream-to",
+            &branch_upstream,
+        ],
+    )?;
 
     // Fetch the latest changes for this repo
     run("git", &["fetch", remote_name])?;
