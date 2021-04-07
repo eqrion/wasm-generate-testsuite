@@ -1,11 +1,14 @@
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use anyhow::{bail, Result};
 use regex::{RegexSet, RegexSetBuilder};
 use serde_derive::{Deserialize, Serialize};
 use toml;
+use wast2js;
 
 use log::{debug, info, warn};
 
@@ -46,8 +49,6 @@ struct Repo {
     excluded_tests: Vec<String>,
     #[serde(default)]
     skip_wast: bool,
-    #[serde(default)]
-    skip_wpt: bool,
     #[serde(default)]
     skip_js: bool,
 }
@@ -100,26 +101,7 @@ struct Status {
 
 // Roll-your-own CLI utilities
 
-#[derive(Debug)]
-enum Error {
-    Io(std::io::Error),
-    Utf8(std::string::FromUtf8Error),
-    FailedProcess(String, String, String),
-}
-
-impl From<std::io::Error> for Error {
-    fn from(other: std::io::Error) -> Error {
-        Error::Io(other)
-    }
-}
-
-impl From<std::string::FromUtf8Error> for Error {
-    fn from(other: std::string::FromUtf8Error) -> Error {
-        Error::Utf8(other)
-    }
-}
-
-fn run(name: &str, args: &[&str]) -> Result<String, Error> {
+fn run(name: &str, args: &[&str]) -> Result<String> {
     debug!("{} {:?}", name, args);
     let output = Command::new(name).args(args).output()?;
     let stdout = String::from_utf8(output.stdout)?.trim().to_owned();
@@ -134,7 +116,7 @@ fn run(name: &str, args: &[&str]) -> Result<String, Error> {
     if output.status.success() {
         Ok(stdout)
     } else {
-        Err(Error::FailedProcess(name.to_owned(), stdout, stderr))
+        bail!("{}: {}\n{}", name.to_owned(), stdout, stderr)
     }
 }
 
@@ -177,7 +159,7 @@ fn find(dir: &str) -> Vec<PathBuf> {
     paths
 }
 
-fn write_string<P: AsRef<Path>>(path: P, text: &str) -> Result<(), Error> {
+fn write_string<P: AsRef<Path>>(path: P, text: &str) -> Result<()> {
     let path = path.as_ref();
     if let Some(dir) = path.parent() {
         let _ = fs::create_dir_all(dir);
@@ -267,7 +249,7 @@ fn clean_and_init_dirs(specs_dir: &str) {
     let _ = fs::remove_dir_all("./tests");
 }
 
-fn build_repo(repo: &Repo, config: &Config, lock: &Lock) -> Result<Status, Error> {
+fn build_repo(repo: &Repo, config: &Config, lock: &Lock) -> Result<Status> {
     let remote_name = &repo.name;
     let remote_url = &repo.url;
     let remote_branch = repo.branch.as_ref().map(|x| x.as_str()).unwrap_or("master");
@@ -309,22 +291,26 @@ fn build_repo(repo: &Repo, config: &Config, lock: &Lock) -> Result<Status, Error
 
     // Try to build the test suite on this commit. This may fail due to merging
     // with a parent repo, in which case we will try again in an unmerged state.
-    let mut built = true;
-    if try_build_tests().is_err() {
-        if repo.parent.is_some() {
-            warn!(
-                "Failed to build interpreter. Retrying on unmerged commit ({})",
-                &commit_base_hash
-            );
-            run("git", &["reset", &commit_base_hash, "--hard"])?;
-            built = try_build_tests().is_ok();
-        } else {
-            built = false;
-        }
-    }
-    if !built {
-        warn!("Failed to build interpreter, Won't emit js/html");
-    }
+    let mut built = false;
+    match try_build_tests() {
+        Ok(()) => built = true,
+        Err(err) => warn!("Failed to build tests: {:?}", err),
+    };
+    // if try_build_tests().is_err() {
+    //     if repo.parent.is_some() {
+    //         warn!(
+    //             "Failed to build interpreter. Retrying on unmerged commit ({})",
+    //             &commit_base_hash
+    //         );
+    //         run("git", &["reset", &commit_base_hash, "--hard"])?;
+    //         built = try_build_tests().is_ok();
+    //     } else {
+    //         built = false;
+    //     }
+    // }
+    // if !built {
+    //     warn!("Failed to build interpreter, Won't emit js/html");
+    // }
 
     // Get the final commit message we ended up on
     let commit_final_message = run("git", &["log", "--oneline", "-n", "1"])?;
@@ -356,9 +342,6 @@ fn build_repo(repo: &Repo, config: &Config, lock: &Lock) -> Result<Status, Error
     if !repo.skip_wast {
         copy_tests(repo, "test/core", "../tests", "wast", &include, &exclude);
     }
-    if built && !repo.skip_wpt {
-        copy_tests(repo, "wpt", "../tests", "wpt", &include, &exclude);
-    }
     if built && !repo.skip_js {
         copy_tests(repo, "js", "../tests", "js", &include, &exclude);
         copy_directives(repo, config)?;
@@ -372,7 +355,7 @@ fn build_repo(repo: &Repo, config: &Config, lock: &Lock) -> Result<Status, Error
     })
 }
 
-fn try_merge_parent(repo: &Repo, commit_base_hash: &str) -> Result<Merge, Error> {
+fn try_merge_parent(repo: &Repo, commit_base_hash: &str) -> Result<Merge> {
     if !repo.parent.is_some() {
         return Ok(Merge::Standalone);
     }
@@ -404,13 +387,28 @@ fn try_merge_parent(repo: &Repo, commit_base_hash: &str) -> Result<Merge, Error>
     )
 }
 
-fn try_build_tests() -> Result<(), Error> {
+fn try_build_tests() -> Result<()> {
     let _ = fs::remove_dir_all("./js");
-    let _ = fs::remove_dir_all("./wpt");
-    run(
-        "test/build.py",
-        &["--use-sync", "--js", "./js", "--html", "./wpt"],
-    )?;
+    fs::create_dir("./js")?;
+
+    let paths = find("./test/core/");
+    for path in paths {
+        if path.extension() != Some(OsStr::new("wast")) {
+            continue;
+        }
+
+        let source = std::fs::read_to_string(&path)?;
+        let script = wast2js::convert(&path, &source)?;
+
+        std::fs::write(
+            Path::new("./js").join(&path.with_extension("wast.js").file_name().unwrap()),
+            &script,
+        )?;
+    }
+
+    fs::create_dir("./js/harness")?;
+    write_string("./js/harness/harness.js", &wast2js::harness())?;
+
     Ok(())
 }
 
@@ -440,7 +438,7 @@ fn copy_tests(
     }
 }
 
-fn copy_directives(repo: &Repo, config: &Config) -> Result<(), Error> {
+fn copy_directives(repo: &Repo, config: &Config) -> Result<()> {
     // Write directives files
     if let Some(harness_directive) = &config.harness_directive {
         let directives_path = Path::new("../tests/js")
@@ -462,7 +460,7 @@ fn copy_directives(repo: &Repo, config: &Config) -> Result<(), Error> {
     Ok(())
 }
 
-fn find_tests_changed(repo: &Repo) -> Result<Vec<String>, Error> {
+fn find_tests_changed(repo: &Repo) -> Result<Vec<String>> {
     let files_changed = if let Some(parent) = repo.parent.as_ref() {
         run(
             "git",
